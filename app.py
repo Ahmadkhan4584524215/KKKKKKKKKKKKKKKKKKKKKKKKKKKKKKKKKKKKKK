@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from google import genai
@@ -11,6 +12,9 @@ from docx import Document
 
 APP_TITLE = "Resume ATS Analyzer"
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODEL_NAME = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 3
 MAX_RESUME_CHARS = 50000
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
@@ -117,15 +121,47 @@ RESUME:
 {resume_text[:MAX_RESUME_CHARS]}
 """
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
     )
-    return clean_json_text(response.text)
+
+    # Retry temporary Gemini 503/429 errors. If the primary model is busy,
+    # fall back to another Flash model.
+    models_to_try = [MODEL_NAME]
+    if FALLBACK_MODEL_NAME != MODEL_NAME:
+        models_to_try.append(FALLBACK_MODEL_NAME)
+
+    last_error = None
+
+    for model_name in models_to_try:
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                return clean_json_text(response.text)
+
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc).upper()
+
+                # Retry only temporary capacity/rate-limit failures.
+                if "503" not in error_text and "UNAVAILABLE" not in error_text and "429" not in error_text:
+                    raise
+
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+
+        # Primary model may be temporarily overloaded; try fallback.
+
+    raise RuntimeError(
+        "Gemini is temporarily unavailable after multiple retries. "
+        f"Primary model: {MODEL_NAME}. Fallback: {FALLBACK_MODEL_NAME}. "
+        "Please try again in a minute."
+    ) from last_error
 
 
 def show_score(score):
@@ -148,7 +184,8 @@ with st.sidebar:
     st.write("3. Gemini analyzes the resume")
     st.write("4. Review the score and improvements")
     st.divider()
-    st.caption(f"Gemini model: `{MODEL_NAME}`")
+    st.caption(f"Primary Gemini model: `{MODEL_NAME}`")
+    st.caption(f"Fallback model: `{FALLBACK_MODEL_NAME}`")
 
 uploaded_file = st.file_uploader(
     "Upload your resume",
@@ -245,8 +282,13 @@ if analyze_clicked:
         )
 
     except Exception as exc:
-        st.error(f"Analysis failed: {exc}")
-        st.info("Check your API key, internet connection, supported file type, and Gemini model availability.")
+        error_text = str(exc)
+        if "temporarily unavailable" in error_text.lower() or "503" in error_text or "UNAVAILABLE" in error_text:
+            st.error("Gemini is temporarily overloaded. The app retried automatically, but both models are currently unavailable.")
+            st.info("Please wait about a minute and click Analyze Resume again.")
+        else:
+            st.error(f"Analysis failed: {exc}")
+            st.info("Check your API key, internet connection, supported file type, and Gemini model availability.")
 
 st.divider()
 st.caption("Note: This tool provides an AI estimate for resume improvement. It is not a guarantee of how a particular employer's ATS will score a resume.")
